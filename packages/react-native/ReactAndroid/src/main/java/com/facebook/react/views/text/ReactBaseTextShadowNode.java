@@ -7,7 +7,6 @@
 
 package com.facebook.react.views.text;
 
-import android.annotation.TargetApi;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.os.Build;
@@ -22,6 +21,7 @@ import com.facebook.infer.annotation.Assertions;
 import com.facebook.react.bridge.ReadableArray;
 import com.facebook.react.bridge.ReadableMap;
 import com.facebook.react.common.ReactConstants;
+import com.facebook.react.common.assets.ReactFontManager;
 import com.facebook.react.uimanager.IllegalViewOperationException;
 import com.facebook.react.uimanager.LayoutShadowNode;
 import com.facebook.react.uimanager.NativeViewHierarchyOptimizer;
@@ -49,14 +49,13 @@ import java.util.Map;
  * <p>This also node calculates {@link Spannable} object based on subnodes of the same type, which
  * can be used in concrete classes to feed native views and compute layout.
  */
-@TargetApi(Build.VERSION_CODES.M)
 public abstract class ReactBaseTextShadowNode extends LayoutShadowNode {
 
   // Use a direction weak character so the placeholder doesn't change the direction of the previous
   // character.
   // https://en.wikipedia.org/wiki/Bi-directional_text#weak_characters
   private static final String INLINE_VIEW_PLACEHOLDER = "0";
-  public static final int UNSET = -1;
+  public static final int UNSET = ReactFontManager.TypefaceStyle.UNSET;
 
   public static final String PROP_SHADOW_OFFSET = "textShadowOffset";
   public static final String PROP_SHADOW_OFFSET_WIDTH = "width";
@@ -70,38 +69,13 @@ public abstract class ReactBaseTextShadowNode extends LayoutShadowNode {
 
   protected @Nullable ReactTextViewManagerCallback mReactTextViewManagerCallback;
 
-  private static class SetSpanOperation {
-    protected int start, end;
-    protected ReactSpan what;
-
-    SetSpanOperation(int start, int end, ReactSpan what) {
-      this.start = start;
-      this.end = end;
-      this.what = what;
-    }
-
-    public void execute(SpannableStringBuilder sb, int priority) {
-      // All spans will automatically extend to the right of the text, but not the left - except
-      // for spans that start at the beginning of the text.
-      int spanFlags = Spannable.SPAN_EXCLUSIVE_INCLUSIVE;
-      if (start == 0) {
-        spanFlags = Spannable.SPAN_INCLUSIVE_INCLUSIVE;
-      }
-
-      spanFlags &= ~Spannable.SPAN_PRIORITY;
-      spanFlags |= (priority << Spannable.SPAN_PRIORITY_SHIFT) & Spannable.SPAN_PRIORITY;
-
-      sb.setSpan(what, start, end, spanFlags);
-    }
-  }
-
   private static void buildSpannedFromShadowNode(
       ReactBaseTextShadowNode textShadowNode,
       SpannableStringBuilder sb,
       List<SetSpanOperation> ops,
-      TextAttributes parentTextAttributes,
+      @Nullable TextAttributes parentTextAttributes,
       boolean supportsInlineViews,
-      Map<Integer, ReactShadowNode> inlineViews,
+      @Nullable Map<Integer, ReactShadowNode> inlineViews,
       int start) {
 
     TextAttributes textAttributes;
@@ -250,7 +224,7 @@ public abstract class ReactBaseTextShadowNode extends LayoutShadowNode {
   // `nativeViewHierarchyOptimizer` can be `null` as long as `supportsInlineViews` is `false`.
   protected Spannable spannedFromShadowNode(
       ReactBaseTextShadowNode textShadowNode,
-      String text,
+      @Nullable String text,
       boolean supportsInlineViews,
       NativeViewHierarchyOptimizer nativeViewHierarchyOptimizer) {
     Assertions.assertCondition(
@@ -264,8 +238,7 @@ public abstract class ReactBaseTextShadowNode extends LayoutShadowNode {
     // up-to-bottom, otherwise all the spannables that are within the region for which one may set
     // a new spannable will be wiped out
     List<SetSpanOperation> ops = new ArrayList<>();
-    Map<Integer, ReactShadowNode> inlineViews =
-        supportsInlineViews ? new HashMap<Integer, ReactShadowNode>() : null;
+    Map<Integer, ReactShadowNode> inlineViews = supportsInlineViews ? new HashMap<>() : null;
 
     if (text != null) {
       // Handle text that is provided via a prop (e.g. the `value` and `defaultValue` props on
@@ -281,8 +254,9 @@ public abstract class ReactBaseTextShadowNode extends LayoutShadowNode {
 
     // While setting the Spans on the final text, we also check whether any of them are inline views
     // or images.
-    int priority = 0;
-    for (SetSpanOperation op : ops) {
+    for (int priorityIndex = 0; priorityIndex < ops.size(); priorityIndex++) {
+      final SetSpanOperation op = ops.get(ops.size() - priorityIndex - 1);
+
       boolean isInlineImage = op.what instanceof TextInlineImageSpan;
       if (isInlineImage || op.what instanceof TextInlineViewPlaceholderSpan) {
         int height;
@@ -309,9 +283,8 @@ public abstract class ReactBaseTextShadowNode extends LayoutShadowNode {
       }
 
       // Actual order of calling {@code execute} does NOT matter,
-      // but the {@code priority} DOES matter.
-      op.execute(sb, priority);
-      priority++;
+      // but the {@code priorityIndex} DOES matter.
+      op.execute(sb, priorityIndex);
     }
 
     textShadowNode.mTextAttributes.setHeightOfTallestInlineViewOrImage(
@@ -336,10 +309,8 @@ public abstract class ReactBaseTextShadowNode extends LayoutShadowNode {
 
   protected int mNumberOfLines = UNSET;
   protected int mTextAlign = Gravity.NO_GRAVITY;
-  protected int mTextBreakStrategy =
-      (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) ? 0 : Layout.BREAK_STRATEGY_HIGH_QUALITY;
-  protected int mHyphenationFrequency =
-      (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) ? 0 : Layout.HYPHENATION_FREQUENCY_NONE;
+  protected int mTextBreakStrategy = Layout.BREAK_STRATEGY_HIGH_QUALITY;
+  protected int mHyphenationFrequency = Layout.HYPHENATION_FREQUENCY_NONE;
   protected int mJustificationMode =
       (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) ? 0 : Layout.JUSTIFICATION_MODE_NONE;
 
@@ -578,10 +549,6 @@ public abstract class ReactBaseTextShadowNode extends LayoutShadowNode {
 
   @ReactProp(name = ViewProps.TEXT_BREAK_STRATEGY)
   public void setTextBreakStrategy(@Nullable String textBreakStrategy) {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
-      return;
-    }
-
     if (textBreakStrategy == null || "highQuality".equals(textBreakStrategy)) {
       mTextBreakStrategy = Layout.BREAK_STRATEGY_HIGH_QUALITY;
     } else if ("simple".equals(textBreakStrategy)) {

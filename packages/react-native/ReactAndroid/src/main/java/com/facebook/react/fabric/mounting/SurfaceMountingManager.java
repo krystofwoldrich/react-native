@@ -15,7 +15,9 @@ import android.view.ViewGroup;
 import android.view.ViewParent;
 import androidx.annotation.AnyThread;
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.annotation.UiThread;
+import androidx.collection.SparseArrayCompat;
 import com.facebook.common.logging.FLog;
 import com.facebook.infer.annotation.Assertions;
 import com.facebook.infer.annotation.ThreadConfined;
@@ -52,12 +54,12 @@ import com.facebook.react.views.view.ReactMapBufferViewManager;
 import com.facebook.react.views.view.ReactViewManagerWrapper;
 import java.util.HashSet;
 import java.util.LinkedList;
+import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
 import java.util.Stack;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import javax.annotation.Nullable;
 
 public class SurfaceMountingManager {
   public static final String TAG = SurfaceMountingManager.class.getSimpleName();
@@ -91,7 +93,8 @@ public class SurfaceMountingManager {
   private RemoveDeleteTreeUIFrameCallback mRemoveDeleteTreeUIFrameCallback;
 
   // This is null *until* StopSurface is called.
-  private Set<Integer> mTagSetForStoppedSurface;
+  private Set<Integer> mTagSetForStoppedSurfaceLegacy;
+  private SparseArrayCompat<Object> mTagSetForStoppedSurface;
 
   private final int mSurfaceId;
 
@@ -166,7 +169,10 @@ public class SurfaceMountingManager {
     // If Surface stopped, check if tag *was* associated with this Surface, even though it's been
     // deleted. This helps distinguish between scenarios where an invalid tag is referenced, vs
     // race conditions where an imperative method is called on a tag during/just after StopSurface.
-    if (mTagSetForStoppedSurface != null && mTagSetForStoppedSurface.contains(tag)) {
+    if (mTagSetForStoppedSurface != null && mTagSetForStoppedSurface.containsKey(tag)) {
+      return true;
+    }
+    if (mTagSetForStoppedSurfaceLegacy != null && mTagSetForStoppedSurfaceLegacy.contains(tag)) {
       return true;
     }
     if (mTagToViewState == null) {
@@ -287,27 +293,38 @@ public class SurfaceMountingManager {
     }
 
     Runnable runnable =
-        new Runnable() {
-          @Override
-          public void run() {
-            // We must call `onDropViewInstance` on all remaining Views
+        () -> {
+          if (ReactFeatureFlags.fixStoppedSurfaceTagSetLeak) {
+            mTagSetForStoppedSurface = new SparseArrayCompat<>();
+            for (Map.Entry<Integer, ViewState> entry : mTagToViewState.entrySet()) {
+              // Using this as a placeholder value in the map. We're using SparseArrayCompat
+              // since it can efficiently represent the list of pending tags
+              mTagSetForStoppedSurface.put(entry.getKey(), this);
+
+              // We must call `onDropViewInstance` on all remaining Views
+              onViewStateDeleted(entry.getValue());
+            }
+          } else {
             for (ViewState viewState : mTagToViewState.values()) {
+              // We must call `onDropViewInstance` on all remaining Views
               onViewStateDeleted(viewState);
             }
-
-            // Evict all views from cache and memory
-            mTagSetForStoppedSurface = mTagToViewState.keySet();
-            mTagToViewState = null;
-            mJSResponderHandler = null;
-            mRootViewManager = null;
-            mMountItemExecutor = null;
-            mOnViewAttachItems.clear();
-
-            if (ReactFeatureFlags.enableViewRecycling) {
-              mViewManagerRegistry.onSurfaceStopped(mSurfaceId);
-            }
-            FLog.e(TAG, "Surface [" + mSurfaceId + "] was stopped on SurfaceMountingManager.");
+            mTagSetForStoppedSurfaceLegacy = mTagToViewState.keySet();
           }
+
+          // Evict all views from cache and memory
+          // TODO: clear instead of nulling out to simplify null-safety in this class
+          mTagToViewState = null;
+          mJSResponderHandler = null;
+          mRootViewManager = null;
+          mMountItemExecutor = null;
+          mThemedReactContext = null;
+          mOnViewAttachItems.clear();
+
+          if (ReactFeatureFlags.enableViewRecycling) {
+            mViewManagerRegistry.onSurfaceStopped(mSurfaceId);
+          }
+          FLog.e(TAG, "Surface [" + mSurfaceId + "] was stopped on SurfaceMountingManager.");
         };
 
     if (UiThreadUtil.isOnUiThread()) {
@@ -1101,23 +1118,13 @@ public class SurfaceMountingManager {
       previousEventEmitterWrapper.destroy();
     }
 
-    Queue<ViewEvent> pendingEventQueue = viewState.mPendingEventQueue;
+    Queue<PendingViewEvent> pendingEventQueue = viewState.mPendingEventQueue;
     if (pendingEventQueue != null) {
       // Invoke pending event queued to the view state
-      for (ViewEvent viewEvent : pendingEventQueue) {
-        dispatchEvent(eventEmitter, viewEvent);
+      for (PendingViewEvent viewEvent : pendingEventQueue) {
+        viewEvent.dispatch(eventEmitter);
       }
       viewState.mPendingEventQueue = null;
-    }
-  }
-
-  private void dispatchEvent(EventEmitterWrapper eventEmitter, ViewEvent viewEvent) {
-    if (viewEvent.canCoalesceEvent()) {
-      eventEmitter.dispatchUnique(
-          viewEvent.getEventName(), viewEvent.getParams(), viewEvent.getCustomCoalesceKey());
-    } else {
-      eventEmitter.dispatch(
-          viewEvent.getEventName(), viewEvent.getParams(), viewEvent.getEventCategory());
     }
   }
 
@@ -1287,10 +1294,13 @@ public class SurfaceMountingManager {
     }
   }
 
-  @UiThread
-  public void enqueuePendingEvent(int reactTag, ViewEvent viewEvent) {
-    UiThreadUtil.assertOnUiThread();
-
+  @AnyThread
+  public void enqueuePendingEvent(
+      int reactTag,
+      String eventName,
+      boolean canCoalesceEvent,
+      @Nullable WritableMap params,
+      @EventCategoryDef int eventCategory) {
     // When the surface stopped we will reset the view state map. We are not going to enqueue
     // pending events as they are not expected to be dispatched anyways.
     if (mTagToViewState == null) {
@@ -1302,23 +1312,23 @@ public class SurfaceMountingManager {
       // Cannot queue event without view state. Do nothing here.
       return;
     }
-    EventEmitterWrapper eventEmitter = viewState.mEventEmitter;
-    if (eventEmitter != null) {
-      // TODO T152630743: Verify threading for mEventEmitter
-      FLog.i(
-          TAG,
-          "Queue pending events when event emitter is null for the given view state, this should be dispatched instead - surfaceId: "
-              + mSurfaceId
-              + " reactTag: "
-              + reactTag);
-      dispatchEvent(eventEmitter, viewEvent);
-      return;
-    }
 
-    if (viewState.mPendingEventQueue == null) {
-      viewState.mPendingEventQueue = new LinkedList<>();
-    }
-    viewState.mPendingEventQueue.add(viewEvent);
+    PendingViewEvent viewEvent =
+        new PendingViewEvent(eventName, params, eventCategory, canCoalesceEvent);
+    UiThreadUtil.runOnUiThread(
+        new Runnable() {
+          @Override
+          public void run() {
+            if (viewState.mEventEmitter != null) {
+              viewEvent.dispatch(viewState.mEventEmitter);
+            } else {
+              if (viewState.mPendingEventQueue == null) {
+                viewState.mPendingEventQueue = new LinkedList<>();
+              }
+              viewState.mPendingEventQueue.add(viewEvent);
+            }
+          }
+        });
   }
 
   /**
@@ -1334,7 +1344,10 @@ public class SurfaceMountingManager {
     @Nullable public ReadableMap mCurrentLocalData = null;
     @Nullable public StateWrapper mStateWrapper = null;
     @Nullable public EventEmitterWrapper mEventEmitter = null;
-    @Nullable public Queue<ViewEvent> mPendingEventQueue = null;
+
+    @ThreadConfined(UI)
+    @Nullable
+    public Queue<PendingViewEvent> mPendingEventQueue = null;
 
     private ViewState(
         int reactTag, @Nullable View view, @Nullable ReactViewManagerWrapper viewManager) {
@@ -1371,44 +1384,29 @@ public class SurfaceMountingManager {
     }
   }
 
-  public static class ViewEvent {
+  private static class PendingViewEvent {
     private final String mEventName;
     private final boolean mCanCoalesceEvent;
-    private final int mCustomCoalesceKey;
     private final @EventCategoryDef int mEventCategory;
-    private @Nullable WritableMap mParams;
+    private final @Nullable WritableMap mParams;
 
-    public ViewEvent(
+    public PendingViewEvent(
         String eventName,
         @Nullable WritableMap params,
         @EventCategoryDef int eventCategory,
-        boolean canCoalesceEvent,
-        int customCoalesceKey) {
+        boolean canCoalesceEvent) {
       mEventName = eventName;
       mParams = params;
       mEventCategory = eventCategory;
       mCanCoalesceEvent = canCoalesceEvent;
-      mCustomCoalesceKey = customCoalesceKey;
     }
 
-    public String getEventName() {
-      return mEventName;
-    }
-
-    public boolean canCoalesceEvent() {
-      return mCanCoalesceEvent;
-    }
-
-    public int getCustomCoalesceKey() {
-      return mCustomCoalesceKey;
-    }
-
-    public @EventCategoryDef int getEventCategory() {
-      return mEventCategory;
-    }
-
-    public @Nullable WritableMap getParams() {
-      return mParams;
+    public void dispatch(EventEmitterWrapper eventEmitter) {
+      if (mCanCoalesceEvent) {
+        eventEmitter.dispatchUnique(mEventName, mParams);
+      } else {
+        eventEmitter.dispatch(mEventName, mParams, mEventCategory);
+      }
     }
   }
 

@@ -43,7 +43,7 @@ function requireModuleParser() {
       };
 
       withBabelRegister(config, () => {
-        RNModuleParser = require('@react-native/codegen/src/parsers/flow/modules');
+        RNModuleParser = require('@react-native/codegen/src/parsers/flow/modules/index');
         RNParserUtils = require('@react-native/codegen/src/parsers/utils');
         RNFlowParser = require('@react-native/codegen/src/parsers/flow/parser');
         RNParserCommons = require('@react-native/codegen/src/parsers/parsers-commons');
@@ -56,7 +56,7 @@ function requireModuleParser() {
       };
 
       withBabelRegister(config, () => {
-        RNModuleParser = require('@react-native/codegen/lib/parsers/flow/modules');
+        RNModuleParser = require('@react-native/codegen/lib/parsers/flow/modules/index');
         RNParserUtils = require('@react-native/codegen/lib/parsers/utils');
         RNFlowParser = require('@react-native/codegen/lib/parsers/flow/parser');
         RNParserCommons = require('@react-native/codegen/lib/parsers/parsers-commons');
@@ -69,7 +69,6 @@ function requireModuleParser() {
     buildModuleSchema: RNParserCommons.buildModuleSchema,
     createParserErrorCapturer: RNParserUtils.createParserErrorCapturer,
     parser: new RNFlowParser.FlowParser(),
-    resolveTypeAnnotation: RNFlowParserUtils.resolveTypeAnnotation,
     translateTypeAnnotation: RNModuleParser.flowTranslateTypeAnnotation,
   };
 }
@@ -149,7 +148,6 @@ function rule(context) {
         buildModuleSchema,
         createParserErrorCapturer,
         parser,
-        resolveTypeAnnotation,
         translateTypeAnnotation,
       } = requireModuleParser();
 
@@ -164,7 +162,6 @@ function rule(context) {
           ast,
           tryParse,
           parser,
-          resolveTypeAnnotation,
           translateTypeAnnotation,
         );
       });

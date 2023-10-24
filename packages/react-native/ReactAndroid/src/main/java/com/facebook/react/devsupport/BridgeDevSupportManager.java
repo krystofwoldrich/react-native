@@ -57,11 +57,6 @@ import java.util.concurrent.TimeoutException;
  * instance manager recreates it (through {@link #onNewReactContextCreated). Also, instance manager
  * is responsible for enabling/disabling dev support in case when app is backgrounded or when all
  * the views has been detached from the instance (through {@link #setDevSupportEnabled} method).
- *
- * IMPORTANT: In order for developer support to work correctly it is required that the
- * manifest of your application contain the following entries:
- * {@code <activity android:name="com.facebook.react.devsupport.DevSettingsActivity" android:exported="false"/>}
- * {@code <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>}
  */
 public final class BridgeDevSupportManager extends DevSupportManagerBase {
   private boolean mIsSamplingProfilerEnabled = false;
@@ -91,9 +86,6 @@ public final class BridgeDevSupportManager extends DevSupportManagerBase {
         surfaceDelegateFactory,
         devLoadingViewManager);
 
-    mReactInstanceManagerHelper = reactInstanceManagerHelper;
-    mDevLoadingViewManager = devLoadingViewManager;
-
     if (getDevSettings().isStartSamplingProfilerOnInit()) {
       // Only start the profiler. If its already running, there is an error
       if (!mIsSamplingProfilerEnabled) {
@@ -115,14 +107,6 @@ public final class BridgeDevSupportManager extends DevSupportManagerBase {
             toggleJSSamplingProfiler();
           }
         });
-  }
-
-  public DevLoadingViewManager getDevLoadingViewManager() {
-    return mDevLoadingViewManager;
-  }
-
-  public ReactInstanceDevHelper getReactInstanceManagerHelper() {
-    return mReactInstanceManagerHelper;
   }
 
   @Override

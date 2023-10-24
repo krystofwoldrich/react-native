@@ -6,6 +6,7 @@
  */
 
 #import "RCTTurboModuleManager.h"
+#import "RCTInteropTurboModule.h"
 
 #import <atomic>
 #import <cassert>
@@ -16,6 +17,7 @@
 
 #import <React/RCTBridge+Private.h>
 #import <React/RCTBridgeModule.h>
+#import <React/RCTBridgeProxy.h>
 #import <React/RCTConstants.h>
 #import <React/RCTCxxModule.h>
 #import <React/RCTInitializing.h>
@@ -30,12 +32,6 @@
 
 using namespace facebook;
 using namespace facebook::react;
-
-static TurboModuleBindingMode sTurboModuleBindingMode = TurboModuleBindingMode::HostObject;
-void RCTTurboModuleSetBindingMode(TurboModuleBindingMode bindingMode)
-{
-  sTurboModuleBindingMode = bindingMode;
-}
 
 /**
  * A global variable whose address we use to associate method queues to id<RCTBridgeModule> objects.
@@ -110,13 +106,13 @@ class ModuleHolder {
   }
 };
 
-class MethodQueueNativeCallInvoker : public CallInvoker {
+class ModuleNativeMethodCallInvoker : public NativeMethodCallInvoker {
  private:
   dispatch_queue_t methodQueue_;
 
  public:
-  MethodQueueNativeCallInvoker(dispatch_queue_t methodQueue) : methodQueue_(methodQueue) {}
-  void invokeAsync(std::function<void()> &&work) override
+  ModuleNativeMethodCallInvoker(dispatch_queue_t methodQueue) : methodQueue_(methodQueue) {}
+  void invokeAsync(const std::string &methodName, std::function<void()> &&work) noexcept override
   {
     if (methodQueue_ == RCTJSThread) {
       work();
@@ -129,19 +125,44 @@ class MethodQueueNativeCallInvoker : public CallInvoker {
     });
   }
 
-  void invokeSync(std::function<void()> &&work) override
+  void invokeSync(const std::string &methodName, std::function<void()> &&work) override
   {
-    if (methodQueue_ == RCTJSThread) {
-      work();
+    work();
+  }
+};
+
+class LegacyModuleNativeMethodCallInvoker : public ModuleNativeMethodCallInvoker {
+  bool requiresMainQueueSetup_;
+
+ public:
+  LegacyModuleNativeMethodCallInvoker(dispatch_queue_t methodQueue, bool requiresMainQueueSetup)
+      : ModuleNativeMethodCallInvoker(methodQueue), requiresMainQueueSetup_(requiresMainQueueSetup)
+  {
+  }
+
+  void invokeSync(const std::string &methodName, std::function<void()> &&work) override
+  {
+    if (requiresMainQueueSetup_ && methodName == "getConstants") {
+      __block auto retainedWork = std::move(work);
+      RCTUnsafeExecuteOnMainQueueSync(^{
+        retainedWork();
+      });
       return;
     }
 
-    __block auto retainedWork = std::move(work);
-    dispatch_sync(methodQueue_, ^{
-      retainedWork();
-    });
+    ModuleNativeMethodCallInvoker::invokeSync(methodName, std::move(work));
   }
 };
+
+bool isTurboModuleClass(Class cls)
+{
+  return [cls conformsToProtocol:@protocol(RCTTurboModule)];
+}
+
+bool isTurboModuleInstance(id module)
+{
+  return isTurboModuleClass([module class]);
+}
 }
 
 // Fallback lookup since RCT class prefix is sometimes stripped in the existing NativeModule system.
@@ -171,6 +192,7 @@ static Class getFallbackClassFromName(const char *name)
    */
   std::unordered_map<std::string, ModuleHolder> _moduleHolders;
   std::unordered_map<std::string, std::shared_ptr<TurboModule>> _turboModuleCache;
+  std::unordered_map<std::string, std::shared_ptr<TurboModule>> _legacyModuleCache;
 
   // Enforce synchronous access into _delegate
   std::mutex _turboModuleManagerDelegateMutex;
@@ -178,9 +200,20 @@ static Class getFallbackClassFromName(const char *name)
   // Enforce synchronous access to _invalidating and _moduleHolders
   std::mutex _moduleHoldersMutex;
   std::atomic<bool> _invalidating;
+
+  NSDictionary<NSString *, id<RCTBridgeModule>> *_legacyEagerlyInitializedModules;
+  NSDictionary<NSString *, Class> *_legacyEagerlyRegisteredModuleClasses;
+
+  RCTBridgeProxy *_bridgeProxy;
+  RCTBridgeModuleDecorator *_bridgeModuleDecorator;
+
+  BOOL _enableSharedModuleQueue;
+  dispatch_queue_t _sharedModuleQueue;
 }
 
 - (instancetype)initWithBridge:(RCTBridge *)bridge
+                   bridgeProxy:(RCTBridgeProxy *)bridgeProxy
+         bridgeModuleDecorator:(RCTBridgeModuleDecorator *)bridgeModuleDecorator
                       delegate:(id<RCTTurboModuleManagerDelegate>)delegate
                      jsInvoker:(std::shared_ptr<CallInvoker>)jsInvoker
 {
@@ -188,32 +221,69 @@ static Class getFallbackClassFromName(const char *name)
     _jsInvoker = std::move(jsInvoker);
     _delegate = delegate;
     _bridge = bridge;
+    _bridgeProxy = bridgeProxy;
+    _bridgeModuleDecorator = bridgeModuleDecorator;
     _invalidating = false;
+    _enableSharedModuleQueue = RCTTurboModuleSharedQueueEnabled();
+
+    if (_enableSharedModuleQueue) {
+      _sharedModuleQueue = dispatch_queue_create("com.meta.react.turbomodulemanager.queue", DISPATCH_QUEUE_SERIAL);
+    }
+
+    if (RCTTurboModuleInteropEnabled()) {
+      NSMutableDictionary<NSString *, id<RCTBridgeModule>> *legacyInitializedModules = [NSMutableDictionary new];
+
+      if ([_delegate respondsToSelector:@selector(extraModulesForBridge:)]) {
+        for (id<RCTBridgeModule> module in [_delegate extraModulesForBridge:nil]) {
+          if (!isTurboModuleInstance(module)) {
+            [legacyInitializedModules setObject:module forKey:RCTBridgeModuleNameForClass([module class])];
+          }
+        }
+      }
+      _legacyEagerlyInitializedModules = legacyInitializedModules;
+
+      NSMutableDictionary<NSString *, Class> *legacyEagerlyRegisteredModuleClasses = [NSMutableDictionary new];
+      for (Class moduleClass in RCTGetModuleClasses()) {
+        if (!isTurboModuleClass(moduleClass)) {
+          [legacyEagerlyRegisteredModuleClasses setObject:moduleClass forKey:RCTBridgeModuleNameForClass(moduleClass)];
+        }
+      }
+      _legacyEagerlyRegisteredModuleClasses = legacyEagerlyRegisteredModuleClasses;
+    }
 
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(bridgeWillInvalidateModules:)
                                                  name:RCTBridgeWillInvalidateModulesNotification
-                                               object:_bridge.parentBridge];
+                                               object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(bridgeDidInvalidateModules:)
                                                  name:RCTBridgeDidInvalidateModulesNotification
-                                               object:_bridge.parentBridge];
+                                               object:nil];
   }
   return self;
 }
 
-- (void)notifyAboutTurboModuleSetup:(const char *)name
+- (instancetype)initWithBridge:(RCTBridge *)bridge
+                      delegate:(id<RCTTurboModuleManagerDelegate>)delegate
+                     jsInvoker:(std::shared_ptr<CallInvoker>)jsInvoker
 {
-  NSString *moduleName = [[NSString alloc] initWithUTF8String:name];
-  if (moduleName) {
-    int64_t setupTime = [self->_bridge.performanceLogger durationForTag:RCTPLTurboModuleSetup];
-    [[NSNotificationCenter defaultCenter] postNotificationName:RCTDidSetupModuleNotification
-                                                        object:nil
-                                                      userInfo:@{
-                                                        RCTDidSetupModuleNotificationModuleNameKey : moduleName,
-                                                        RCTDidSetupModuleNotificationSetupTimeKey : @(setupTime)
-                                                      }];
-  }
+  return [self initWithBridge:bridge
+                  bridgeProxy:nil
+        bridgeModuleDecorator:[bridge bridgeModuleDecorator]
+                     delegate:delegate
+                    jsInvoker:jsInvoker];
+}
+
+- (instancetype)initWithBridgeProxy:(RCTBridgeProxy *)bridgeProxy
+              bridgeModuleDecorator:(RCTBridgeModuleDecorator *)bridgeModuleDecorator
+                           delegate:(id<RCTTurboModuleManagerDelegate>)delegate
+                          jsInvoker:(std::shared_ptr<CallInvoker>)jsInvoker
+{
+  return [self initWithBridge:nil
+                  bridgeProxy:bridgeProxy
+        bridgeModuleDecorator:bridgeModuleDecorator
+                     delegate:delegate
+                    jsInvoker:jsInvoker];
 }
 
 /**
@@ -256,7 +326,8 @@ static Class getFallbackClassFromName(const char *name)
   /**
    * Step 2: Look for platform-specific modules.
    */
-  id<RCTBridgeModule> module = [self _provideObjCModule:moduleName];
+  id<RCTBridgeModule> module =
+      !RCTTurboModuleInteropEnabled() || [self _isTurboModule:moduleName] ? [self _provideObjCModule:moduleName] : nil;
 
   TurboModulePerfLogger::moduleJSRequireEndingStart(moduleName);
 
@@ -276,14 +347,15 @@ static Class getFallbackClassFromName(const char *name)
   /**
    * Step 2c: Create and native CallInvoker from the TurboModule's method queue.
    */
-  std::shared_ptr<CallInvoker> nativeInvoker = std::make_shared<MethodQueueNativeCallInvoker>(methodQueue);
+  std::shared_ptr<NativeMethodCallInvoker> nativeMethodCallInvoker =
+      std::make_shared<ModuleNativeMethodCallInvoker>(methodQueue);
 
   /**
    * Have RCTCxxBridge decorate native CallInvoker, so that it's aware of TurboModule async method calls.
    * This helps the bridge fire onBatchComplete as readily as it should.
    */
-  if ([_bridge respondsToSelector:@selector(decorateNativeCallInvoker:)]) {
-    nativeInvoker = [_bridge decorateNativeCallInvoker:nativeInvoker];
+  if ([_bridge respondsToSelector:@selector(decorateNativeMethodCallInvoker:)]) {
+    nativeMethodCallInvoker = [_bridge decorateNativeMethodCallInvoker:nativeMethodCallInvoker];
   }
 
   /**
@@ -309,8 +381,9 @@ static Class getFallbackClassFromName(const char *name)
         .moduleName = moduleName,
         .instance = module,
         .jsInvoker = _jsInvoker,
-        .nativeInvoker = nativeInvoker,
+        .nativeMethodCallInvoker = nativeMethodCallInvoker,
         .isSyncModule = methodQueue == RCTJSThread,
+        .shouldVoidMethodsExecuteSync = (bool)RCTTurboModuleSyncVoidMethodsEnabled(),
     };
 
     auto turboModule = [(id<RCTTurboModule>)module getTurboModule:params];
@@ -322,6 +395,92 @@ static Class getFallbackClassFromName(const char *name)
   }
 
   return nullptr;
+}
+
+- (std::shared_ptr<TurboModule>)provideLegacyModule:(const char *)moduleName
+{
+  auto legacyModuleLookup = _legacyModuleCache.find(moduleName);
+  if (legacyModuleLookup != _legacyModuleCache.end()) {
+    TurboModulePerfLogger::moduleJSRequireBeginningCacheHit(moduleName);
+    TurboModulePerfLogger::moduleJSRequireBeginningEnd(moduleName);
+    return legacyModuleLookup->second;
+  }
+
+  TurboModulePerfLogger::moduleJSRequireBeginningEnd(moduleName);
+
+  // Create platform-specific native module object
+  id<RCTBridgeModule> module = [self _isLegacyModule:moduleName] ? [self _provideObjCModule:moduleName] : nil;
+
+  TurboModulePerfLogger::moduleJSRequireEndingStart(moduleName);
+
+  // If we request that a TurboModule be created, its respective ObjC class must exist
+  // If the class doesn't exist, then provideRCTBridgeModule returns nil
+  if (!module) {
+    return nullptr;
+  }
+
+  Class moduleClass = [module class];
+
+  dispatch_queue_t methodQueue = (dispatch_queue_t)objc_getAssociatedObject(module, &kAssociatedMethodQueueKey);
+  if (methodQueue == nil) {
+    RCTLogError(@"Legacy NativeModule \"%@\" was not associated with a method queue.", moduleClass);
+  }
+
+  // Create a native call invoker from module's method queue
+  std::shared_ptr<NativeMethodCallInvoker> nativeMethodCallInvoker =
+      std::make_shared<LegacyModuleNativeMethodCallInvoker>(methodQueue, [self _requiresMainQueueSetup:moduleClass]);
+
+  // If module is a legacy cxx module, return TurboCxxModule
+  if ([moduleClass isSubclassOfClass:RCTCxxModule.class]) {
+    // Use TurboCxxModule compat class to wrap the CxxModule instance.
+    // This is only for migration convenience, despite less performant.
+    auto turboModule = std::make_shared<TurboCxxModule>([((RCTCxxModule *)module) createModule], _jsInvoker);
+    _legacyModuleCache.insert({moduleName, turboModule});
+    return turboModule;
+  }
+
+  // Create interop module
+  ObjCTurboModule::InitParams params = {
+      .moduleName = moduleName,
+      .instance = module,
+      .jsInvoker = _jsInvoker,
+      .nativeMethodCallInvoker = std::move(nativeMethodCallInvoker),
+      .isSyncModule = methodQueue == RCTJSThread,
+      .shouldVoidMethodsExecuteSync = (bool)RCTTurboModuleSyncVoidMethodsEnabled(),
+  };
+
+  auto turboModule = std::make_shared<ObjCInteropTurboModule>(params);
+  _legacyModuleCache.insert({moduleName, turboModule});
+  return turboModule;
+}
+
+- (BOOL)_isTurboModule:(const char *)moduleName
+{
+  if (RCTTurboModuleInteropForAllTurboModulesEnabled()) {
+    return NO;
+  }
+
+  Class moduleClass = [self _getModuleClassFromName:moduleName];
+  return moduleClass != nil && (isTurboModuleClass(moduleClass) && ![moduleClass isSubclassOfClass:RCTCxxModule.class]);
+}
+
+- (BOOL)_isLegacyModule:(const char *)moduleName
+{
+  if (RCTTurboModuleInteropForAllTurboModulesEnabled()) {
+    return YES;
+  }
+
+  Class moduleClass = [self _getModuleClassFromName:moduleName];
+  return [self _isLegacyModuleClass:moduleClass];
+}
+
+- (BOOL)_isLegacyModuleClass:(Class)moduleClass
+{
+  if (RCTTurboModuleInteropForAllTurboModulesEnabled()) {
+    return YES;
+  }
+
+  return moduleClass != nil && (!isTurboModuleClass(moduleClass) || [moduleClass isSubclassOfClass:RCTCxxModule.class]);
 }
 
 - (ModuleHolder *)_getOrCreateModuleHolder:(const char *)moduleName
@@ -389,25 +548,14 @@ static Class getFallbackClassFromName(const char *name)
   }
 
   if (shouldCreateModule) {
-    Class moduleClass;
-
     /**
      * Step 2a: Resolve platform-specific class.
      */
-    if (RCTTurboModuleManagerDelegateLockingDisabled()) {
-      moduleClass = [_delegate getModuleClassFromName:moduleName];
-    } else {
-      std::lock_guard<std::mutex> delegateGuard(_turboModuleManagerDelegateMutex);
-      moduleClass = [_delegate getModuleClassFromName:moduleName];
-    }
-
-    if (!moduleClass) {
-      moduleClass = getFallbackClassFromName(moduleName);
-    }
+    Class moduleClass = [self _getModuleClassFromName:moduleName];
 
     __block id<RCTBridgeModule> module = nil;
 
-    if ([moduleClass conformsToProtocol:@protocol(RCTTurboModule)]) {
+    if ([self _shouldCreateObjCModule:moduleClass]) {
       __weak __typeof(self) weakSelf = self;
       dispatch_block_t work = ^{
         auto strongSelf = weakSelf;
@@ -420,17 +568,6 @@ static Class getFallbackClassFromName(const char *name)
       };
 
       if ([self _requiresMainQueueSetup:moduleClass]) {
-        /**
-         * When TurboModule eager initialization is enabled, there shouldn't be any TurboModule initializations on the
-         * main queue.
-         * TODO(T69449176) Roll out TurboModule eager initialization, and remove this check.
-         */
-        if (RCTTurboModuleEagerInitEnabled() && !RCTIsMainQueue()) {
-          RCTLogWarn(
-              @"TurboModule \"%@\" requires synchronous dispatch onto the main queue to be initialized. This may lead to deadlock.",
-              moduleClass);
-        }
-
         RCTUnsafeExecuteOnMainQueueSync(work);
       } else {
         work();
@@ -465,6 +602,15 @@ static Class getFallbackClassFromName(const char *name)
   return moduleHolder->getModule();
 }
 
+- (BOOL)_shouldCreateObjCModule:(Class)moduleClass
+{
+  if (RCTTurboModuleInteropEnabled()) {
+    return [moduleClass conformsToProtocol:@protocol(RCTBridgeModule)];
+  }
+
+  return [moduleClass conformsToProtocol:@protocol(RCTTurboModule)];
+}
+
 /**
  * Given a NativeModule class, and its name, create and initialize it synchronously.
  *
@@ -484,15 +630,7 @@ static Class getFallbackClassFromName(const char *name)
    */
 
   TurboModulePerfLogger::moduleCreateConstructStart(moduleName, moduleId);
-  if (RCTTurboModuleManagerDelegateLockingDisabled()) {
-    module = (id<RCTBridgeModule>)[_delegate getModuleInstanceFromClass:moduleClass];
-  } else {
-    std::lock_guard<std::mutex> delegateGuard(_turboModuleManagerDelegateMutex);
-    module = (id<RCTBridgeModule>)[_delegate getModuleInstanceFromClass:moduleClass];
-  }
-  if (!module) {
-    module = [moduleClass new];
-  }
+  module = [self _getModuleInstanceFromClass:moduleClass];
   TurboModulePerfLogger::moduleCreateConstructEnd(moduleName, moduleId);
 
   TurboModulePerfLogger::moduleCreateSetUpStart(moduleName, moduleId);
@@ -506,7 +644,7 @@ static Class getFallbackClassFromName(const char *name)
    * this method exists to know if we can safely set the bridge to the
    * NativeModule.
    */
-  if ([module respondsToSelector:@selector(bridge)] && _bridge) {
+  if ([module respondsToSelector:@selector(bridge)] && (_bridge || _bridgeProxy)) {
     /**
      * Just because a NativeModule has the `bridge` method, it doesn't mean
      * that it has synthesized the bridge in its implementation. Therefore,
@@ -523,7 +661,11 @@ static Class getFallbackClassFromName(const char *name)
        * generated, so we have have to rely on the KVC API of ObjC to set
        * the bridge property of these NativeModules.
        */
-      [(id)module setValue:_bridge forKey:@"bridge"];
+      if (_bridge) {
+        [(id)module setValue:_bridge forKey:@"bridge"];
+      } else if (_bridgeProxy && [self _isLegacyModuleClass:[module class]]) {
+        [(id)module setValue:_bridgeProxy forKey:@"bridge"];
+      }
     } @catch (NSException *exception) {
       RCTLogError(
           @"%@ has no setter or ivar for its bridge, which is not "
@@ -551,8 +693,12 @@ static Class getFallbackClassFromName(const char *name)
    * following if condition's block.
    */
   if (!methodQueue) {
-    NSString *methodQueueName = [NSString stringWithFormat:@"com.facebook.react.%sQueue", moduleName];
-    methodQueue = dispatch_queue_create(methodQueueName.UTF8String, DISPATCH_QUEUE_SERIAL);
+    if (_enableSharedModuleQueue) {
+      methodQueue = _sharedModuleQueue;
+    } else {
+      NSString *methodQueueName = [NSString stringWithFormat:@"com.facebook.react.%sQueue", moduleName];
+      methodQueue = dispatch_queue_create(methodQueueName.UTF8String, DISPATCH_QUEUE_SERIAL);
+    }
 
     if (moduleHasMethodQueueGetter) {
       /**
@@ -580,8 +726,8 @@ static Class getFallbackClassFromName(const char *name)
   /**
    * Decorate NativeModules with bridgeless-compatible APIs that call into the bridge.
    */
-  if (_bridge) {
-    [_bridge attachBridgeAPIsToObjCModule:module];
+  if (_bridgeModuleDecorator) {
+    [_bridgeModuleDecorator attachInteropAPIsToModule:module];
   }
 
   /**
@@ -628,6 +774,69 @@ static Class getFallbackClassFromName(const char *name)
                   userInfo:@{@"module" : module, @"bridge" : RCTNullIfNil([_bridge parentBridge])}];
 
   TurboModulePerfLogger::moduleCreateSetUpEnd(moduleName, moduleId);
+
+  return module;
+}
+
+- (Class)_getModuleClassFromName:(const char *)moduleName
+{
+  NSString *moduleNameStr = @(moduleName);
+  if (_legacyEagerlyInitializedModules && _legacyEagerlyInitializedModules[moduleNameStr]) {
+    return [_legacyEagerlyInitializedModules[moduleNameStr] class];
+  }
+
+  if (_legacyEagerlyRegisteredModuleClasses && _legacyEagerlyRegisteredModuleClasses[moduleNameStr]) {
+    return _legacyEagerlyRegisteredModuleClasses[moduleNameStr];
+  }
+
+  Class moduleClass = nil;
+  {
+    std::lock_guard<std::mutex> delegateGuard(_turboModuleManagerDelegateMutex);
+    moduleClass = [_delegate getModuleClassFromName:moduleName];
+  }
+
+  if (moduleClass != nil) {
+    return moduleClass;
+  }
+
+  moduleClass = getFallbackClassFromName(moduleName);
+  if (moduleClass != nil) {
+    return moduleClass;
+  }
+
+  // fallback on modules registered throught RCT_EXPORT_MODULE with custom names
+  NSString *objcModuleName = [NSString stringWithUTF8String:moduleName];
+  NSArray<Class> *modules = RCTGetModuleClasses();
+  for (Class current in modules) {
+    NSString *currentModuleName = [current moduleName];
+    if ([objcModuleName isEqualToString:currentModuleName]) {
+      return current;
+    }
+  }
+
+  return moduleClass;
+}
+
+- (id<RCTBridgeModule>)_getModuleInstanceFromClass:(Class)moduleClass
+{
+  NSString *moduleNameStr = RCTBridgeModuleNameForClass(moduleClass);
+  if (_legacyEagerlyInitializedModules && _legacyEagerlyInitializedModules[moduleNameStr]) {
+    return _legacyEagerlyInitializedModules[moduleNameStr];
+  }
+
+  if (_legacyEagerlyRegisteredModuleClasses && _legacyEagerlyRegisteredModuleClasses[moduleNameStr]) {
+    return [_legacyEagerlyRegisteredModuleClasses[moduleNameStr] new];
+  }
+
+  id<RCTBridgeModule> module = nil;
+  {
+    std::lock_guard<std::mutex> delegateGuard(_turboModuleManagerDelegateMutex);
+    module = (id<RCTBridgeModule>)[_delegate getModuleInstanceFromClass:moduleClass];
+  }
+
+  if (!module) {
+    module = [moduleClass new];
+  }
 
   return module;
 }
@@ -685,13 +894,8 @@ static Class getFallbackClassFromName(const char *name)
   return requiresMainQueueSetup;
 }
 
-- (void)installJSBindingWithRuntimeExecutor:(facebook::react::RuntimeExecutor &)runtimeExecutor
+- (void)installJSBindings:(facebook::jsi::Runtime &)runtime
 {
-  if (!runtimeExecutor) {
-    // jsi::Runtime doesn't exist when attached to Chrome debugger.
-    return;
-  }
-
   /**
    * We keep TurboModuleManager alive until the JS VM is deleted.
    * It is perfectly valid to only use/create TurboModules from JS.
@@ -717,7 +921,6 @@ static Class getFallbackClassFromName(const char *name)
 
     if (moduleWasNotInitialized && [self moduleIsInitialized:moduleName]) {
       [self->_bridge.performanceLogger markStopForTag:RCTPLTurboModuleSetup];
-      [self notifyAboutTurboModuleSetup:moduleName];
     }
 
     if (turboModule) {
@@ -725,13 +928,34 @@ static Class getFallbackClassFromName(const char *name)
     } else {
       TurboModulePerfLogger::moduleJSRequireEndingFail(moduleName);
     }
-
     return turboModule;
   };
 
-  runtimeExecutor([turboModuleProvider = std::move(turboModuleProvider)](jsi::Runtime &runtime) {
-    TurboModuleBinding::install(runtime, sTurboModuleBindingMode, std::move(turboModuleProvider));
-  });
+  if (RCTTurboModuleInteropEnabled()) {
+    auto legacyModuleProvider = [self](const std::string &name) -> std::shared_ptr<react::TurboModule> {
+      auto moduleName = name.c_str();
+
+      TurboModulePerfLogger::moduleJSRequireBeginningStart(moduleName);
+
+      /**
+       * By default, all TurboModules are long-lived.
+       * Additionally, if a TurboModule with the name `name` isn't found, then we
+       * trigger an assertion failure.
+       */
+      auto turboModule = [self provideLegacyModule:moduleName];
+
+      if (turboModule) {
+        TurboModulePerfLogger::moduleJSRequireEndingEnd(moduleName);
+      } else {
+        TurboModulePerfLogger::moduleJSRequireEndingFail(moduleName);
+      }
+      return turboModule;
+    };
+
+    TurboModuleBinding::install(runtime, std::move(turboModuleProvider), std::move(legacyModuleProvider));
+  } else {
+    TurboModuleBinding::install(runtime, std::move(turboModuleProvider));
+  }
 }
 
 #pragma mark RCTTurboModuleRegistry
@@ -852,6 +1076,7 @@ static Class getFallbackClassFromName(const char *name)
 
   _moduleHolders.clear();
   _turboModuleCache.clear();
+  _legacyModuleCache.clear();
 }
 
 @end

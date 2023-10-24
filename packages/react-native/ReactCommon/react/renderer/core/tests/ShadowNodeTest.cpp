@@ -18,7 +18,7 @@ using namespace facebook::react;
 class ShadowNodeTest : public ::testing::Test {
  protected:
   ShadowNodeTest()
-      : eventDispatcher_(std::shared_ptr<EventDispatcher const>()),
+      : eventDispatcher_(std::shared_ptr<const EventDispatcher>()),
         componentDescriptor_(TestComponentDescriptor({eventDispatcher_})) {
     /*
      * The structure:
@@ -41,7 +41,7 @@ class ShadowNodeTest : public ::testing::Test {
         ShadowNodeFamilyFragment{
             /* .tag = */ 11,
             /* .surfaceId = */ surfaceId_,
-            /* .eventEmitter = */ nullptr,
+            /* .instanceHandle = */ nullptr,
         },
         eventDispatcher_,
         componentDescriptor_);
@@ -57,7 +57,7 @@ class ShadowNodeTest : public ::testing::Test {
         ShadowNodeFamilyFragment{
             /* .tag = */ 12,
             /* .surfaceId = */ surfaceId_,
-            /* .eventEmitter = */ nullptr,
+            /* .instanceHandle = */ nullptr,
         },
         eventDispatcher_,
         componentDescriptor_);
@@ -73,7 +73,7 @@ class ShadowNodeTest : public ::testing::Test {
         ShadowNodeFamilyFragment{
             /* .tag = */ 13,
             /* .surfaceId = */ surfaceId_,
-            /* .eventEmitter = */ nullptr,
+            /* .instanceHandle = */ nullptr,
         },
         eventDispatcher_,
         componentDescriptor_);
@@ -92,7 +92,7 @@ class ShadowNodeTest : public ::testing::Test {
         ShadowNodeFamilyFragment{
             /* .tag = */ 15,
             /* .surfaceId = */ surfaceId_,
-            /* .eventEmitter = */ nullptr,
+            /* .instanceHandle = */ nullptr,
         },
         eventDispatcher_,
         componentDescriptor_);
@@ -108,7 +108,7 @@ class ShadowNodeTest : public ::testing::Test {
         ShadowNodeFamilyFragment{
             /* .tag = */ 16,
             /* .surfaceId = */ surfaceId_,
-            /* .eventEmitter = */ nullptr,
+            /* .instanceHandle = */ nullptr,
         },
         eventDispatcher_,
         componentDescriptor_);
@@ -127,7 +127,7 @@ class ShadowNodeTest : public ::testing::Test {
         ShadowNodeFamilyFragment{
             /* .tag = */ 17,
             /* .surfaceId = */ surfaceId_,
-            /* .eventEmitter = */ nullptr,
+            /* .instanceHandle = */ nullptr,
         },
         eventDispatcher_,
         componentDescriptor_);
@@ -143,7 +143,7 @@ class ShadowNodeTest : public ::testing::Test {
         ShadowNodeFamilyFragment{
             /* .tag = */ 18,
             /* .surfaceId = */ surfaceId_,
-            /* .eventEmitter = */ nullptr,
+            /* .instanceHandle = */ nullptr,
         },
         eventDispatcher_,
         componentDescriptor_);
@@ -156,7 +156,7 @@ class ShadowNodeTest : public ::testing::Test {
         traits);
   }
 
-  std::shared_ptr<EventDispatcher const> eventDispatcher_;
+  std::shared_ptr<const EventDispatcher> eventDispatcher_;
   std::shared_ptr<TestShadowNode> nodeA_;
   std::shared_ptr<TestShadowNode> nodeAA_;
   std::shared_ptr<TestShadowNode> nodeABA_;
@@ -174,7 +174,7 @@ TEST_F(ShadowNodeTest, handleShadowNodeCreation) {
   EXPECT_STREQ(nodeZ_->getComponentName(), "Test");
   EXPECT_EQ(nodeZ_->getTag(), 18);
   EXPECT_EQ(nodeZ_->getSurfaceId(), surfaceId_);
-  EXPECT_EQ(nodeZ_->getEventEmitter(), nullptr);
+  EXPECT_NE(nodeZ_->getEventEmitter(), nullptr);
   EXPECT_EQ(nodeZ_->getChildren().size(), 0);
 }
 
@@ -238,7 +238,7 @@ TEST_F(ShadowNodeTest, handleState) {
       ShadowNodeFamilyFragment{
           /* .tag = */ 9,
           /* .surfaceId = */ surfaceId_,
-          /* .eventEmitter = */ nullptr,
+          /* .instanceHandle = */ nullptr,
       },
       eventDispatcher_,
       componentDescriptor_);
@@ -247,7 +247,7 @@ TEST_F(ShadowNodeTest, handleState) {
 
   auto props = std::make_shared<const TestProps>();
 
-  auto const initialState =
+  const auto initialState =
       componentDescriptor_.createInitialState(props, family);
 
   auto firstNode = std::make_shared<TestShadowNode>(

@@ -74,9 +74,11 @@ generateCodegenSchemaFromJavaScript () {
         echo "$RCT_SCRIPT_JS_SRCS_DIR" >> "${SCRIPT_OUTPUT_FILE_0}" 2>&1
     fi
 
+    CODEGEN_COMBINE_SCRIPT=$("$NODE_BINARY" --print "require.resolve('@react-native/codegen/cli/combine/combine-js-to-schema-cli.js')")
+
     # shellcheck disable=SC2086
     # $JS_SRCS not having double quotations is intentional
-    "$NODE_BINARY" "$CODEGEN_CLI_PATH/lib/cli/combine/combine-js-to-schema-cli.js" "$GENERATED_SCHEMA_FILE" $JS_SRCS
+    "$NODE_BINARY" "$CODEGEN_COMBINE_SCRIPT" "$GENERATED_SCHEMA_FILE" $JS_SRCS
 }
 
 generateCodegenArtifactsFromSchema () {
@@ -104,7 +106,7 @@ moveOutputs () {
     mkdir -p "$RCT_SCRIPT_OUTPUT_DIR"
 
     # Copy all output to output_dir
-    cp -R "$TEMP_OUTPUT_DIR/." "$RCT_SCRIPT_OUTPUT_DIR" || exit 1
+    cp -R -X "$TEMP_OUTPUT_DIR/." "$RCT_SCRIPT_OUTPUT_DIR" || exit 1
     echo "$LIBRARY_NAME output has been written to $RCT_SCRIPT_OUTPUT_DIR:" >> "${SCRIPT_OUTPUT_FILE_0}" 2>&1
     ls -1 "$RCT_SCRIPT_OUTPUT_DIR" >> "${SCRIPT_OUTPUT_FILE_0}" 2>&1
 }

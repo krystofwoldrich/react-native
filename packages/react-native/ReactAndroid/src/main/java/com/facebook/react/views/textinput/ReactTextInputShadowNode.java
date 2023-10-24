@@ -7,17 +7,16 @@
 
 package com.facebook.react.views.textinput;
 
-import android.annotation.TargetApi;
-import android.os.Build;
 import android.text.Layout;
 import android.util.TypedValue;
 import android.view.ViewGroup;
 import android.widget.EditText;
 import androidx.annotation.Nullable;
+import androidx.appcompat.view.ContextThemeWrapper;
 import androidx.core.view.ViewCompat;
 import com.facebook.common.logging.FLog;
 import com.facebook.infer.annotation.Assertions;
-import com.facebook.react.bridge.ReadableMap;
+import com.facebook.react.R;
 import com.facebook.react.common.ReactConstants;
 import com.facebook.react.common.annotations.VisibleForTesting;
 import com.facebook.react.uimanager.Spacing;
@@ -34,7 +33,6 @@ import com.facebook.yoga.YogaMeasureOutput;
 import com.facebook.yoga.YogaNode;
 
 @VisibleForTesting
-@TargetApi(Build.VERSION_CODES.M)
 public class ReactTextInputShadowNode extends ReactBaseTextShadowNode
     implements YogaMeasureFunction {
 
@@ -44,21 +42,15 @@ public class ReactTextInputShadowNode extends ReactBaseTextShadowNode
 
   @VisibleForTesting public static final String PROP_TEXT = "text";
   @VisibleForTesting public static final String PROP_PLACEHOLDER = "placeholder";
-  @VisibleForTesting public static final String PROP_SELECTION = "selection";
 
   // Represents the {@code text} property only, not possible nested content.
   private @Nullable String mText = null;
   private @Nullable String mPlaceholder = null;
-  private int mSelectionStart = UNSET;
-  private int mSelectionEnd = UNSET;
 
   public ReactTextInputShadowNode(
       @Nullable ReactTextViewManagerCallback reactTextViewManagerCallback) {
     super(reactTextViewManagerCallback);
-    mTextBreakStrategy =
-        (Build.VERSION.SDK_INT < Build.VERSION_CODES.M)
-            ? Layout.BREAK_STRATEGY_SIMPLE
-            : Layout.BREAK_STRATEGY_HIGH_QUALITY;
+    mTextBreakStrategy = Layout.BREAK_STRATEGY_HIGH_QUALITY;
 
     initMeasureFunction();
   }
@@ -120,8 +112,7 @@ public class ReactTextInputShadowNode extends ReactBaseTextShadowNode
         editText.setLines(mNumberOfLines);
       }
 
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
-          && editText.getBreakStrategy() != mTextBreakStrategy) {
+      if (editText.getBreakStrategy() != mTextBreakStrategy) {
         editText.setBreakStrategy(mTextBreakStrategy);
       }
     }
@@ -165,18 +156,6 @@ public class ReactTextInputShadowNode extends ReactBaseTextShadowNode
   @ReactProp(name = PROP_TEXT)
   public void setText(@Nullable String text) {
     mText = text;
-    if (text != null) {
-      // The selection shouldn't be bigger than the length of the text
-      if (mSelectionStart > text.length()) {
-        mSelectionStart = text.length();
-      }
-      if (mSelectionEnd > text.length()) {
-        mSelectionEnd = text.length();
-      }
-    } else {
-      mSelectionStart = UNSET;
-      mSelectionEnd = UNSET;
-    }
     markUpdated();
   }
 
@@ -194,24 +173,8 @@ public class ReactTextInputShadowNode extends ReactBaseTextShadowNode
     return mPlaceholder;
   }
 
-  @ReactProp(name = PROP_SELECTION)
-  public void setSelection(@Nullable ReadableMap selection) {
-    mSelectionStart = mSelectionEnd = UNSET;
-    if (selection == null) return;
-
-    if (selection.hasKey("start") && selection.hasKey("end")) {
-      mSelectionStart = selection.getInt("start");
-      mSelectionEnd = selection.getInt("end");
-      markUpdated();
-    }
-  }
-
   @Override
   public void setTextBreakStrategy(@Nullable String textBreakStrategy) {
-    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
-      return;
-    }
-
     if (textBreakStrategy == null || "simple".equals(textBreakStrategy)) {
       mTextBreakStrategy = Layout.BREAK_STRATEGY_SIMPLE;
     } else if ("highQuality".equals(textBreakStrategy)) {
@@ -245,9 +208,7 @@ public class ReactTextInputShadowNode extends ReactBaseTextShadowNode
               getPadding(Spacing.BOTTOM),
               mTextAlign,
               mTextBreakStrategy,
-              mJustificationMode,
-              mSelectionStart,
-              mSelectionEnd);
+              mJustificationMode);
       uiViewOperationQueue.enqueueUpdateExtraData(getReactTag(), reactTextUpdate);
     }
   }
@@ -263,6 +224,13 @@ public class ReactTextInputShadowNode extends ReactBaseTextShadowNode
    * {@code EditText} this class uses to determine the expected size of the view.
    */
   protected EditText createInternalEditText() {
-    return new EditText(getThemedContext());
+    // By setting a style which has a background drawable, this EditText will have a different
+    // background drawable instance from that on the UI Thread, which maybe has a default background
+    // drawable instance.
+    // Otherwise, DrawableContainer is not a thread safe class, and it caused the npe in #29452.
+    ContextThemeWrapper context =
+        new ContextThemeWrapper(
+            getThemedContext(), R.style.Theme_ReactNative_TextInput_DefaultBackground);
+    return new EditText(context);
   }
 }

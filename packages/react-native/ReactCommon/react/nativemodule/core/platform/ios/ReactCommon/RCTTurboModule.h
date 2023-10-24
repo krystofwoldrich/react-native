@@ -30,6 +30,7 @@ class Instance;
 
 namespace TurboModuleConvertUtils {
 jsi::Value convertObjCObjectToJSIValue(jsi::Runtime &runtime, id value);
+id convertJSIValueToObjCObject(jsi::Runtime &runtime, const jsi::Value &value, std::shared_ptr<CallInvoker> jsInvoker);
 }
 
 /**
@@ -42,8 +43,9 @@ class JSI_EXPORT ObjCTurboModule : public TurboModule {
     std::string moduleName;
     id<RCTBridgeModule> instance;
     std::shared_ptr<CallInvoker> jsInvoker;
-    std::shared_ptr<CallInvoker> nativeInvoker;
+    std::shared_ptr<NativeMethodCallInvoker> nativeMethodCallInvoker;
     bool isSyncModule;
+    bool shouldVoidMethodsExecuteSync;
   };
 
   ObjCTurboModule(const InitParams &params);
@@ -57,23 +59,68 @@ class JSI_EXPORT ObjCTurboModule : public TurboModule {
       size_t count);
 
   id<RCTBridgeModule> instance_;
-  std::shared_ptr<CallInvoker> nativeInvoker_;
+  std::shared_ptr<NativeMethodCallInvoker> nativeMethodCallInvoker_;
 
  protected:
   void setMethodArgConversionSelector(NSString *methodName, int argIndex, NSString *fnName);
+
+  /**
+   * Why is this virtual?
+   *
+   * Purpose: Converts native module method returns from Objective C values to JavaScript values.
+   *
+   * ObjCTurboModule uses TurboModuleMethodValueKind to convert returns from Objective C values to JavaScript values.
+   * ObjCInteropTurboModule just blindly converts returns from Objective C values to JavaScript values by runtime type,
+   * because it cannot infer TurboModuleMethodValueKind from the RCT_EXPORT_METHOD annotations.
+   */
   virtual jsi::Value convertReturnIdToJSIValue(
       jsi::Runtime &runtime,
       const char *methodName,
       TurboModuleMethodValueKind returnType,
       id result);
 
+  /**
+   * Why is this virtual?
+   *
+   * Purpose: Get a native module method's argument's type, given the method name, and argument index.
+   *
+   * ObjCInteropTurboModule computes the argument type names eagerly on module init. So, make this method virtual. That
+   * way, ObjCInteropTurboModule doesn't end up computing the argument types twice: once on module init, and second on
+   * method dispatch.
+   */
+  virtual NSString *getArgumentTypeName(jsi::Runtime &runtime, NSString *methodName, int argIndex);
+
+  /**
+   * Why is this virtual?
+   *
+   * Purpose: Convert arguments from JavaScript values to Objective C values. Assign the Objective C argument to the
+   * method invocation.
+   *
+   * ObjCInteropTurboModule relies heavily on RCTConvert to convert arguments from JavaScript values to Objective C
+   * values. ObjCTurboModule tries to minimize reliance on RCTConvert: RCTConvert uses the RCT_EXPORT_METHOD macros,
+   * which we want to remove long term from React Native.
+   */
+  virtual void setInvocationArg(
+      jsi::Runtime &runtime,
+      const char *methodName,
+      const std::string &objCArgType,
+      const jsi::Value &arg,
+      size_t i,
+      NSInvocation *inv,
+      NSMutableArray *retainedObjectsForInvocation);
+
  private:
   // Does the NativeModule dispatch async methods to the JS thread?
   const bool isSyncModule_;
 
+  // Should void methods execute synchronously?
+  const bool shouldVoidMethodsExecuteSync_;
+
   /**
    * TODO(ramanpreet):
    * Investigate an optimization that'll let us get rid of this NSMutableDictionary.
+   * Perhaps, have the code-generated TurboModule subclass implement
+   * getMethodArgConversionSelector below.
    */
   NSMutableDictionary<NSString *, NSMutableArray *> *methodArgConversionSelectors_;
   NSDictionary<NSString *, NSArray<NSString *> *> *methodArgumentTypeNames_;
@@ -81,7 +128,6 @@ class JSI_EXPORT ObjCTurboModule : public TurboModule {
   bool isMethodSync(TurboModuleMethodValueKind returnType);
   BOOL hasMethodArgConversionSelector(NSString *methodName, int argIndex);
   SEL getMethodArgConversionSelector(NSString *methodName, int argIndex);
-  NSString *getArgumentTypeName(jsi::Runtime &runtime, NSString *methodName, int argIndex);
   NSInvocation *createMethodInvocation(
       jsi::Runtime &runtime,
       bool isSync,
@@ -90,17 +136,14 @@ class JSI_EXPORT ObjCTurboModule : public TurboModule {
       const jsi::Value *args,
       size_t count,
       NSMutableArray *retainedObjectsForInvocation);
-  void setInvocationArg(
-      jsi::Runtime &runtime,
-      const char *methodName,
-      const std::string &objCArgType,
-      const jsi::Value &arg,
-      size_t i,
-      NSInvocation *inv,
-      NSMutableArray *retainedObjectsForInvocation);
   id performMethodInvocation(
       jsi::Runtime &runtime,
       bool isSync,
+      const char *methodName,
+      NSInvocation *inv,
+      NSMutableArray *retainedObjectsForInvocation);
+  void performVoidMethodInvocation(
+      jsi::Runtime &runtime,
       const char *methodName,
       NSInvocation *inv,
       NSMutableArray *retainedObjectsForInvocation);
@@ -125,6 +168,6 @@ class JSI_EXPORT ObjCTurboModule : public TurboModule {
  */
 @interface RCTBridge (RCTTurboModule)
 - (std::shared_ptr<facebook::react::CallInvoker>)jsCallInvoker;
-- (std::shared_ptr<facebook::react::CallInvoker>)decorateNativeCallInvoker:
-    (std::shared_ptr<facebook::react::CallInvoker>)nativeInvoker;
+- (std::shared_ptr<facebook::react::NativeMethodCallInvoker>)decorateNativeMethodCallInvoker:
+    (std::shared_ptr<facebook::react::NativeMethodCallInvoker>)nativeMethodCallInvoker;
 @end

@@ -33,8 +33,6 @@ public interface Binding {
       boolean isRTL,
       boolean doLeftAndRightSwapInRTL);
 
-  public void renderTemplateToSurface(int surfaceId, String uiTemplate);
-
   public void stopSurface(int surfaceId);
 
   public void setPixelDensity(float pointScaleFactor);
@@ -51,6 +49,8 @@ public interface Binding {
       boolean doLeftAndRightSwapInRTL);
 
   public void driveCxxAnimations();
+
+  public void reportMount(int surfaceId);
 
   public ReadableNativeMap getInspectorDataForInstance(EventEmitterWrapper eventEmitterWrapper);
 

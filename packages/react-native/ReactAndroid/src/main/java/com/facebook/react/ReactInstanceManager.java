@@ -86,6 +86,9 @@ import com.facebook.react.devsupport.interfaces.DevLoadingViewManager;
 import com.facebook.react.devsupport.interfaces.DevSupportManager;
 import com.facebook.react.devsupport.interfaces.PackagerStatusCallback;
 import com.facebook.react.devsupport.interfaces.RedBoxHandler;
+import com.facebook.react.internal.turbomodule.core.TurboModuleManager;
+import com.facebook.react.internal.turbomodule.core.TurboModuleManagerDelegate;
+import com.facebook.react.internal.turbomodule.core.interfaces.TurboModuleRegistry;
 import com.facebook.react.modules.appearance.AppearanceModule;
 import com.facebook.react.modules.appregistry.AppRegistry;
 import com.facebook.react.modules.core.DefaultHardwareBackBtnHandler;
@@ -94,9 +97,6 @@ import com.facebook.react.modules.core.ReactChoreographer;
 import com.facebook.react.modules.debug.interfaces.DeveloperSettings;
 import com.facebook.react.packagerconnection.RequestHandler;
 import com.facebook.react.surface.ReactStage;
-import com.facebook.react.turbomodule.core.TurboModuleManager;
-import com.facebook.react.turbomodule.core.TurboModuleManagerDelegate;
-import com.facebook.react.turbomodule.core.interfaces.TurboModuleRegistry;
 import com.facebook.react.uimanager.DisplayMetricsHolder;
 import com.facebook.react.uimanager.ReactRoot;
 import com.facebook.react.uimanager.UIManagerHelper;
@@ -185,7 +185,7 @@ public class ReactInstanceManager {
   private final @Nullable JSIModulePackage mJSIModulePackage;
   private final @Nullable ReactPackageTurboModuleManagerDelegate.Builder mTMMDelegateBuilder;
   private List<ViewManager> mViewManagers;
-  private boolean mUseFallbackBundle = false;
+  private boolean mUseFallbackBundle = true;
 
   private class ReactContextInitParams {
     private final JavaScriptExecutorFactory mJsExecutorFactory;
@@ -276,7 +276,12 @@ public class ReactInstanceManager {
       mPackages.add(
           new CoreModulesPackage(
               this,
-              this::invokeDefaultOnBackPressed,
+              new DefaultHardwareBackBtnHandler() {
+                @Override
+                public void invokeDefaultOnBackPressed() {
+                  ReactInstanceManager.this.invokeDefaultOnBackPressed();
+                }
+              },
               lazyViewManagersEnabled,
               minTimeLeftInFrameForNonBatchedOperationMs));
       if (mUseDeveloperSupport) {
@@ -1237,8 +1242,7 @@ public class ReactInstanceManager {
               reactRoot.getRootViewGroup(),
               initialProperties == null
                   ? new WritableNativeMap()
-                  : Arguments.fromBundle(initialProperties),
-              reactRoot.getInitialUITemplate());
+                  : Arguments.fromBundle(initialProperties));
       reactRoot.setRootViewTag(rootTag);
       reactRoot.runApplication();
     }
@@ -1308,11 +1312,7 @@ public class ReactInstanceManager {
 
     synchronized (mAttachedReactRoots) {
       for (ReactRoot reactRoot : mAttachedReactRoots) {
-        if (ReactFeatureFlags.unmountApplicationOnInstanceDetach) {
-          detachRootViewFromInstance(reactRoot, reactContext);
-        } else {
-          clearReactRoot(reactRoot);
-        }
+        detachRootViewFromInstance(reactRoot, reactContext);
       }
     }
 
@@ -1358,6 +1358,13 @@ public class ReactInstanceManager {
 
     reactContext.initializeWithInstance(catalystInstance);
 
+    // On Old Architecture, we need to initialize the Native Runtime Scheduler so that
+    // the `nativeRuntimeScheduler` object is registered on JS.
+    // On New Architecture, this is normally triggered by instantiate a TurboModuleManager.
+    // Here we invoke getRuntimeScheduler() to trigger the creation of it regardless of the
+    // architecture so it will always be there.
+    catalystInstance.getRuntimeScheduler();
+
     if (ReactFeatureFlags.useTurboModules && mTMMDelegateBuilder != null) {
       TurboModuleManagerDelegate tmmDelegate =
           mTMMDelegateBuilder
@@ -1370,7 +1377,7 @@ public class ReactInstanceManager {
               catalystInstance.getRuntimeExecutor(),
               tmmDelegate,
               catalystInstance.getJSCallInvokerHolder(),
-              catalystInstance.getNativeCallInvokerHolder());
+              catalystInstance.getNativeMethodCallInvokerHolder());
 
       catalystInstance.setTurboModuleManager(turboModuleManager);
 

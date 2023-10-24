@@ -11,8 +11,8 @@
 # - dir_manager: a class that implements the `Dir` interface. Defaults to `Dir`, the Dependency can be injected for testing purposes.
 # @throws an error if it could not find the codegen folder.
 def build_codegen!(react_native_path, relative_installation_root, dir_manager: Dir)
-    codegen_repo_path = "#{relative_installation_root}/#{react_native_path}/../react-native-codegen";
-    codegen_npm_path = "#{relative_installation_root}/#{react_native_path}/../@react-native/codegen";
+    codegen_repo_path = "#{basePath(react_native_path, relative_installation_root)}/../react-native-codegen";
+    codegen_npm_path = "#{basePath(react_native_path, relative_installation_root)}/../@react-native/codegen";
     codegen_cli_path = ""
 
     if dir_manager.exist?(codegen_repo_path)
@@ -21,11 +21,6 @@ def build_codegen!(react_native_path, relative_installation_root, dir_manager: D
       codegen_cli_path = codegen_npm_path
     else
       raise "[codegen] Could not find react-native-codegen."
-    end
-
-    if !dir_manager.exist?("#{codegen_cli_path}/lib")
-      Pod::UI.puts "[Codegen] building #{codegen_cli_path}."
-      system("#{codegen_cli_path}/scripts/oss/build.sh")
     end
   end
 
@@ -41,7 +36,7 @@ def checkAndGenerateEmptyThirdPartyProvider!(react_native_path, new_arch_enabled
 
     relative_installation_root = Pod::Config.instance.installation_root.relative_path_from(Pathname.pwd)
 
-    output_dir = "#{react_native_path}/React/Fabric"
+    output_dir = "#{relative_installation_root}/#{react_native_path}/React/Fabric"
 
     provider_h_path = "#{output_dir}/RCTThirdPartyFabricComponentsProvider.h"
     provider_cpp_path ="#{output_dir}/RCTThirdPartyFabricComponentsProvider.mm"
@@ -61,7 +56,7 @@ def checkAndGenerateEmptyThirdPartyProvider!(react_native_path, new_arch_enabled
         Pod::Executable.execute_command(
         'node',
         [
-            "#{relative_installation_root}/#{react_native_path}/scripts/generate-provider-cli.js",
+            "#{basePath(react_native_path, relative_installation_root)}/scripts/generate-provider-cli.js",
             "--platform", 'ios',
             "--schemaListPath", temp_schema_list_path,
             "--outputDir", "#{output_dir}"
@@ -81,7 +76,7 @@ def run_codegen!(
   codegen_output_dir: 'build/generated/ios',
   config_key: 'codegenConfig',
   package_json_file: '~/app/package.json',
-  folly_version: '2021.07.22.00',
+  folly_version: '2023.08.07.00',
   codegen_utils: CodegenUtils.new()
   )
 
@@ -106,5 +101,14 @@ def run_codegen!(
       :hermes_enabled => hermes_enabled
     )
     codegen_utils.generate_react_codegen_podspec!(react_codegen_spec, codegen_output_dir)
+  end
+end
+
+def basePath(react_native_path, relative_installation_root)
+  expanded_path = File.expand_path(react_native_path)
+  if expanded_path == react_native_path
+    react_native_path
+  else
+    File.join(relative_installation_root.to_s, react_native_path)
   end
 end

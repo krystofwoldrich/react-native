@@ -42,23 +42,9 @@ let rejectionTrackingOptions: $NonMaybeType<Parameters<enable>[0]> = {
     }
 
     const warning = `Possible unhandled promise rejection (id: ${id}):\n${
-      message ?? ''
+      stack ?? message ?? ''
     }`;
-    if (__DEV__) {
-      LogBox.addLog({
-        level: 'warn',
-        message: {
-          content: warning,
-          substitutions: [],
-        },
-        componentStack: [],
-        componentStackType: null,
-        stack,
-        category: 'possible_unhandled_promise_rejection',
-      });
-    } else {
-      console.warn(warning);
-    }
+    console.warn(warning);
   },
   onHandled: id => {
     const warning =
